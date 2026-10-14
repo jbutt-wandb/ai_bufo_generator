@@ -21,3 +21,4 @@ logs/
 wandb/
 
 scripts/smoke_test.py
+scripts/test_assets/

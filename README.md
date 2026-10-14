@@ -14,14 +14,18 @@ Three models cooperate per request:
 
 ```
 marimo UI (cluster GPU node, reached via SSH tunnel)
-   └─ Bufo Director agent (OpenAI Agents SDK, Kimi-K2.6)
-        ├─ 1. rewrite_bufo_prompt   Kimi rewrites the idea into MiniMax-H3's
-        │                           structured prompt format
-        ├─ 2. pick_workflow         Laya scores the task types on the user's
-        │                           prompt → t2va / i2va / l2va / fl2va / ref2va
-        └─ 3. generate_bufo_video   MiniMax-H3 renders video + audio
-   └─ result card in marimo; every step is a Weave trace and the agent run
-      lands in the Weave Agents view
+   └─ Bufo Director agent (OpenAI Agents SDK, Kimi-K2.6) — orchestrates the crew
+        ├─ 1. pick_workflow      Laya scores the task types on the user's
+        │                        prompt → t2va / i2va / l2va / fl2va / ref2va
+        ├─ 2. write_screenplay ─► Bufo Screenwriter agent
+        │                           retrieves the MiniMax prompt guide (sliced
+        │                           to the routed task) + the Bufo character
+        │                           description, then writes the prompt
+        └─ 3. shoot_video      ─► Bufo Cameraman agent
+                                    renders the screenplay verbatim with
+                                    MiniMax-H3 (video + audio)
+   └─ result card in marimo; every step is a Weave trace and the three agents
+      appear as one grouped session in the Weave Agents view
 ```
 
 > 📖 **Deep-dive:** [docs/generation_workflow.md](docs/generation_workflow.md)
@@ -49,6 +53,8 @@ marimo UI (cluster GPU node, reached via SSH tunnel)
 
 ### Manual setup (humans)
 
+If your environment and directory structure is configured correctly, you can skip to step 4.
+
 ```bash
 # 1. Clone and configure secrets. .env is synced to the cluster on purpose —
 #    the app reads WANDB_API_KEY / HF_TOKEN there.
@@ -69,6 +75,7 @@ ssh coreweave-login 'cd bufo_gen && ./scripts/launch_cluster.sh'
 
 # 5. On your laptop: tunnel to the compute node — run the EXACT command printed
 #    by step 4 (it targets the node's IP; compute-node hostnames don't resolve).
+# THIS WILL FREEZE YOUR TERMINAL! Don't be alarmed, it means its working, go to step 6
 ssh -N -L 2718:<node-ip>:2718 coreweave-login
 
 # 6. Open the app. The very first generation also downloads the ~124GB of
@@ -92,8 +99,11 @@ ssh coreweave-login 'scancel <jobid>'
   generation time and by import-time asserts on the UI presets
   (`src/bufo_gen/config.py`).
 - **Smoke test:** `scripts/smoke_test.py` runs the real pipeline end-to-end on
-  the fast preset. It loads its **own** copy of the model on the same GPUs —
-  never run it while someone may be generating in the app.
+  the fast preset, always with an input image
+  (`scripts/test_assets/bufo_reference.png`) so Laya routing is genuinely
+  exercised — it asserts the `i2va` route. It loads its **own** copy of the
+  model on the same GPUs — never run it while someone may be generating in
+  the app.
 - **Monitoring:** app logs in `logs/marimo.log` on the cluster; every Slurm job
   gets a SUNK Grafana dashboard (link printed by the launch script); pipeline
   behavior is in [Weave](https://wandb.ai/wandb-smle/jb_bufo_gen/weave).
@@ -138,21 +148,25 @@ video, and accordions with the full per-class scores and the rewritten prompt:
 
 ## Backend workflow and traces
 
-One click on **Generate** produces exactly three Weave traces plus an agent
-run. In [the traces view](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/traces)
-each generation appears as the triple `rewrite_prompt` → `select_workflow` →
+One click on **Generate** produces exactly three Weave traces plus a grouped
+multi-agent session. In
+[the traces view](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/traces) each
+generation appears as the triple `select_workflow` → `rewrite_prompt` →
 `generate_video`:
 
 ![Traces list](docs/images/weave_traces.png)
 
-1. **`rewrite_prompt`** — inputs: your raw prompt, the model id
-   (`moonshotai/Kimi-K2.6`), image count, clip duration; output: the full
-   structured MiniMax-H3 prompt Kimi wrote.
-2. **`select_workflow`** — inputs: your raw prompt, image count, the router
+1. **`select_workflow`** — inputs: your raw prompt, image count, the router
    model id (fixed to Laya); output: the raw per-class scores (one independent
    binary question per candidate task type — a class may have several
    paraphrased probes, scored as their max), the normalized probabilities over
    all five classes, the decision, and each class's description.
+2. **`rewrite_prompt`** — inputs: your raw prompt, the model id
+   (`moonshotai/Kimi-K2.6`), image count, clip duration, and the routed
+   workflow; output: the full structured MiniMax-H3 prompt. Inside it the
+   **Screenwriter agent** retrieves its two reference documents — the prompt
+   guide sliced to the routed task type and the Bufo character description
+   (`docs/bufo_description.md`) — before writing.
 3. **`generate_video`** — inputs: the rewritten prompt, the routed workflow,
    canvas/frames/steps/seed, and — for image-bearing workflows — the uploaded
    reference images themselves, rendered viewable in the trace. Output: the
@@ -160,10 +174,12 @@ each generation appears as the triple `rewrite_prompt` → `select_workflow` →
 
 ![generate_video trace with reference image input and playable output](docs/images/weave_generate_trace.png)
 
-The Bufo Director agent run that orchestrated those tools lands in the
-[Agents view](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/agents) — one
-conversation per generation with the model turns, tool calls, token usage and
-cost:
+The three agents — **Bufo Director** (orchestration), **Bufo Screenwriter**
+(reference retrieval + prompt writing) and **Bufo Cameraman** (verbatim
+rendering) — land in the
+[Agents view](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/agents) as one
+session per generation (shared `group_id`), each with its own conversation,
+tool calls, token usage and cost:
 
 ![Weave Agents view](docs/images/weave_agents.png)
 
@@ -176,11 +192,16 @@ generation tool errored — the tool error text is in the agent conversation.
 ## Repo map
 
 - `app.py` — the marimo app (UI, upload guards, progress narration)
-- `src/bufo_gen/` — `director.py` (agent + tools), `classifier.py` (Laya
-  router), `generator.py` (MiniMax-H3), `tracing.py` (Weave setup),
-  `prompt_guide.py`, `config.py` (presets/ceilings)
+- `src/bufo_gen/` — `director.py` (the three agents + tools), `classifier.py`
+  (Laya router), `generator.py` (MiniMax-H3), `tracing.py` (Weave setup),
+  `prompt_guide.py` (reference-document retrieval loaders), `config.py`
+  (presets/ceilings)
 - `docs/generation_workflow.md` — end-to-end workflow deep-dive (Forge services,
   routing, MiniMax task types, GPU backend, diagrams)
-- `docs/minimax_prompt_guide.md` — the prompt format reference
+- `docs/minimax_prompt_guide.md` — the prompt format reference (retrieved by
+  the Screenwriter at run time, sliced per task type)
+- `docs/bufo_description.md` — researched Bufo character brief (retrieved by
+  the Screenwriter so generations actually look like Bufo)
 - `docs/images/` — README screenshots
-- `scripts/` — `sync.sh`, `launch_cluster.sh`, `smoke_test.py`, `tunnel.sh`
+- `scripts/` — `sync.sh`, `launch_cluster.sh`, `smoke_test.py`, `tunnel.sh`,
+  `test_assets/bufo_reference.png` (smoke-test input image)

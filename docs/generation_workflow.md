@@ -23,75 +23,64 @@ Inference.
 flowchart TD
     U["User: prompt + up to 2 reference images\n(marimo app, SSH tunnel to the GPU node)"] --> D
 
-    subgraph D["Bufo Director — agent loop (OpenAI Agents SDK, Kimi-K2.6 on Forge Inference)"]
-        T1["1 · rewrite_bufo_prompt\nKimi rewrites the idea into\nMiniMax-H3's structured prompt"] --> T2
-        T2["2 · pick_workflow\nLaya scores the task types\non the user's own words"] --> T3
-        T3["3 · generate_bufo_video\nMiniMax-H3 renders video + audio\non 2x H100"]
+    subgraph D["Bufo Director — orchestrator agent (OpenAI Agents SDK, Kimi-K2.6 on Forge Inference)"]
+        T1["1 · pick_workflow\nLaya scores the task types\non the user's own words"] --> T2
+        T2["2 · write_screenplay"] --> T3
+        T3["3 · shoot_video"]
     end
 
-    T3 --> R["Result card in marimo:\nworkflow + probability, embedded mp4,\nscores & rewritten prompt"]
-    D -. every step traced .-> W["Forge Weave\n3 op traces + agent run"]
+    T2 --> SW["Bufo Screenwriter — agent\nretrieve_reference('prompt_guide')\nretrieve_reference('bufo_description')\n→ writes the MiniMax-H3 prompt"]
+    T3 --> CM["Bufo Cameraman — agent\nrender_video: MiniMax-H3\nrenders the screenplay verbatim\non 2x H100"]
+
+    CM --> R["Result card in marimo:\nworkflow + probability, embedded mp4,\nscores & rewritten prompt"]
+    D -. every step traced .-> W["Forge Weave\n3 op traces + a grouped\n3-agent session"]
 ```
 
-Each **Generate** click produces exactly three Weave traces (`rewrite_prompt`,
-`select_workflow`, `generate_video`) plus one agent conversation in the Agents
-view.
+Each **Generate** click produces exactly three Weave traces (`select_workflow`,
+`rewrite_prompt`, `generate_video`) plus one grouped three-agent session in the
+Agents view (Director, Screenwriter, Cameraman share a `group_id`).
 
 ## The agentic layer
 
-The orchestrator is a single agent — the **Bufo Director** — built on the
-OpenAI Agents SDK with `Kimi-K2.6` as its model, served from Forge Inference
-through the SDK's OpenAI-compatible client (auth = `WANDB_API_KEY`, usage
-attributed to the Weave project via the `OpenAI-Project` header). Defined in
+The pipeline is a **three-agent crew**, all built on the OpenAI Agents SDK with
+`Kimi-K2.6` as the model, served from Forge Inference through the SDK's
+OpenAI-compatible client (auth = `WANDB_API_KEY`, usage attributed to the
+Weave project via the `OpenAI-Project` header). Defined in
 `src/bufo_gen/director.py`.
+
+| Agent | Role | Tools |
+|---|---|---|
+| **Bufo Director** | Orchestrates the fixed sequence, recovers from errors, writes the closing one-liner | `pick_workflow`, `write_screenplay`, `shoot_video` |
+| **Bufo Screenwriter** | Retrieves its references, then writes the structured MiniMax prompt — the deliberative, creative agent | `retrieve_reference` |
+| **Bufo Cameraman** | Renders the screenplay verbatim — deliberately thin, kept as a named agent for Agents-view visibility | `render_video` |
 
 Design decisions worth knowing:
 
-- **Three tools, fixed order.** The director is instructed to call
-  `rewrite_bufo_prompt` → `pick_workflow` → `generate_bufo_video` exactly once
-  each, then reply with a one-sentence summary (an Agents SDK run must end with
-  a text message; the UI doesn't display it, but it appears in the trace and in
-  error reports).
-- **State passing, not argument passing.** The tools communicate through a
+- **Route first, then write.** The Director routes before delegating the
+  screenplay, so the Screenwriter retrieves only the prompt-guide section for
+  the routed task type — a format/route mismatch is impossible by construction.
+- **Knowledge is retrieved, not memorized.** The Screenwriter's system prompt
+  contains no MiniMax format and no Bufo lore; it must call
+  `retrieve_reference` for the guide (sliced per task type from
+  `docs/minimax_prompt_guide.md`) and for the researched Bufo character brief
+  (`docs/bufo_description.md` — Kimi doesn't know what a Bufo looks like).
+  The retrieved texts are visible in the trace exactly as the agent saw them.
+- **One session, three conversations.** Every `Runner.run` shares a per-click
+  `RunConfig(group_id=...)`, so the Agents view groups the three agents into
+  one session per generation.
+- **State passing, not argument passing.** The agents communicate through a
   shared `BufoRun` dataclass (prompt, image paths, canvas, results) rather than
-  having the model re-emit long strings as tool arguments — an LLM re-typing a
+  re-emitting long strings as tool arguments — an LLM re-typing a
   2,000-character prompt verbatim is a failure mode we avoid by construction.
 - **Errors are surfaced, never swallowed.** A custom `failure_error_function`
   passes the real exception text back to the model (the SDK default hides it),
-  and the director is instructed to report failures honestly instead of
+  and every agent is instructed to report failures honestly instead of
   claiming success. The UI independently fails loudly if no video file exists.
-- **The creative work is delegated.** The director itself only orchestrates;
-  the actual prompt rewriting is a separate Kimi call inside the rewrite tool
-  (see below). Same model, different system prompt, separately traced.
-- **Guardrails live outside the agent.** Canvas size, duration and step count
+- **Guardrails live outside the agents.** Canvas size, duration and step count
   come from UI presets/inputs validated against measured hardware ceilings — a
   creative model can never pick a configuration that OOMs the GPUs.
 
-## Step 1 — Forge Inference rewrites the prompt
-
-MiniMax-H3 wants a very specific prompt shape, not casual English. The
-`rewrite_prompt` op (`director.py`) sends one chat completion to
-`https://api.inference.wandb.ai/v1` with:
-
-- **System prompt:** the condensed MiniMax-H3 prompt-writing guide
-  (`src/bufo_gen/prompt_guide.py`, derived from
-  [`docs/minimax_prompt_guide.md`](minimax_prompt_guide.md)) plus instructions
-  to star Bufo, be cinematic, and pick the right format from the uploads.
-- **User message:** the raw request, the image count, and the clip duration
-  (so timestamps and keyframe alignment come out right).
-
-Kimi returns the structured prompt — labeled sections like
-`integrated_multimodal_description` with `[Shot N]` blocks, explicit camera
-motion (type + amplitude + speed), diegetic sounds inline,
-`overall_soundscape`, and `non_diegetic_music`. Because MiniMax-H3 generates
-the **soundtrack from the same prompt**, the rewrite quality directly shapes
-the audio, not just the visuals.
-
-Trace: [`rewrite_prompt`](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/traces)
-— inputs: `user_prompt`, `model`, `n_images`, `duration_s`; output: the
-rewritten prompt.
-
-## Step 2 — Laya ("System 1") decides the MiniMax task
+## Step 1 — Laya ("System 1") decides the MiniMax task
 
 [Laya](https://huggingface.co/convaiinnovations/laya) is a **non-autoregressive
 classifier** — a 421M-parameter ModernBERT-large encoder with a scoring head,
@@ -132,8 +121,37 @@ and the normalized probabilities over all five classes, plus each class's
 description — so the decision is fully auditable in Weave.
 
 Note what Laya does *not* see: the images themselves (only their count) and the
-rewritten prompt (routing runs on the user's own words, where intent like
-"starting from my image" lives).
+screenplay (routing runs FIRST, on the user's own words, where intent like
+"starting from my image" lives — the Screenwriter then writes for the routed
+task type).
+
+## Step 2 — Forge Inference writes the screenplay (Screenwriter agent)
+
+MiniMax-H3 wants a very specific prompt shape, not casual English. The
+`rewrite_prompt` op (`director.py`) wraps a full **Screenwriter agent run** on
+`https://api.inference.wandb.ai/v1`:
+
+1. The Screenwriter first calls its `retrieve_reference` tool twice — fetching
+   the MiniMax prompt-writing guide **sliced to the routed task type** (from
+   [`docs/minimax_prompt_guide.md`](minimax_prompt_guide.md)) and the Bufo
+   character brief ([`docs/bufo_description.md`](bufo_description.md), web-
+   researched because Kimi has no idea what a Bufo looks like).
+2. It then writes the prompt, grounding Bufo's appearance in the retrieved
+   description and following the retrieved format precisely. Its input message
+   carries the raw request, task type, image count, and clip duration (so
+   timestamps and keyframe alignment come out right).
+
+The result is the structured prompt — labeled sections like
+`integrated_multimodal_description` with `[Shot N]` blocks, explicit camera
+motion (type + amplitude + speed), diegetic sounds inline,
+`overall_soundscape`, and `non_diegetic_music`. Because MiniMax-H3 generates
+the **soundtrack from the same prompt**, the screenplay quality directly shapes
+the audio, not just the visuals.
+
+Trace: [`rewrite_prompt`](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/traces)
+— inputs: `user_prompt`, `model`, `n_images`, `duration_s`, `workflow`;
+output: the rewritten prompt; the retrieval calls and model turns appear in
+the Screenwriter's conversation in the Agents view.
 
 ## Step 3 — MiniMax-H3 renders the clip
 
@@ -207,11 +225,13 @@ What lands where, per generation:
 - **[Traces](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/traces)** — the
   three ops with full inputs/outputs. Uploaded reference images are passed as
   PIL images, so they render *viewable* on the `generate_video` trace; the
-  output mp4 renders *playable*. The Kimi completion nests under
-  `rewrite_prompt`.
+  output mp4 renders *playable*. The root trace list stays concise: the
+  agents' model turns and tool calls live in the Agents view, not here.
 - **[Agents view](https://wandb.ai/wandb-smle/jb_bufo_gen/weave/agents)** —
-  one conversation per generation: the director's model turns, tool calls,
-  token usage, cost, and error rate across runs.
+  one grouped session per generation (shared `group_id`) containing all three
+  agents: the Director's orchestration turns, the Screenwriter's
+  `retrieve_reference` calls (with the retrieved guide/Bufo texts), the
+  Cameraman's `render_video` call, plus token usage, cost, and error rate.
 
 Debugging heuristics: `n_images: 0` on `select_workflow` means the upload never
 reached the server (uploads reset on app restart/page reload); image inputs

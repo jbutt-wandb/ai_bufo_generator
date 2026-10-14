@@ -1,71 +1,64 @@
-"""The MiniMax-H3 prompt-writing guide, embedded as text for the director agent.
+"""Retrieval loaders for the Screenwriter's reference documents.
 
-Condensed from the official guide on the MiniMaxAI/MiniMax-H3 model card; the
-human-readable version lives in docs/minimax_prompt_guide.md.
+The MiniMax prompt guide and the Bufo character description are deliberately
+NOT baked into any system prompt: the Screenwriter agent retrieves them at run
+time via its retrieve_reference tool, so the knowledge is external, versioned
+in docs/, and visible in the trace exactly as the agent received it.
 """
 
-PROMPT_GUIDE = """
-# How to write MiniMax-H3 prompts
+from pathlib import Path
 
-The final prompt is ONE string of labeled sections. Which sections depend on the
-workflow:
+# The app runs with CWD ~/bufo_gen but the smoke test must not depend on CWD.
+_DOCS = Path(__file__).parents[2] / "docs"
 
-## t2va and the keyframe tasks (i2va, l2va, fl2va) — three sections, in this exact order
-integrated_multimodal_description: <visuals, actions, dialogue and diegetic audio,
-  chronological, organized into [Shot N] blocks>
-overall_soundscape: <ambient + physical action sounds, 1-4 sentences>
-non_diegetic_music: <background score description, 1-3 sentences>
+# Guide sections (## headings in docs/minimax_prompt_guide.md) by relevance:
+_SHARED_SECTIONS = ("Shots and camera motion", "Dialogue and voiceover", "Audio")
+_FORMAT_SECTIONS = {
+    "t2va": ("Prompt structure",),
+    "i2va": ("Prompt structure", "Keyframe alignment", "Example skeleton"),
+    "l2va": ("Prompt structure", "Keyframe alignment", "Example skeleton"),
+    "fl2va": ("Prompt structure", "Keyframe alignment", "Example skeleton"),
+    "ref2va": ("Reference-guided prompts",),
+}
 
-## ref2va — six sections, in this exact order
-subject_definitions: <define reusable labels (see Labels below)>
-summary: [<task types>] <one-paragraph gist of the target video>
-retention_analysis: <per label: how faithfully it is kept>
-detailed_description: <the [Shot N] narrative, same rules as
-  integrated_multimodal_description>
-overall_soundscape: <as above>
-non_diegetic_music: <as above>
 
-## Keyframe alignment (i2va, l2va, fl2va)
-State explicitly where each picture lands on the timeline, at the top of the
-description.
-- fl2va (both keyframes): e.g. "Picture 1 aligns with the 0.00-second mark;
-  Picture 2 aligns with the 5.17-second mark." The action must BEGIN in the
-  position established by Picture 1 and SETTLE INTO the pose/composition of
-  Picture 2.
-- i2va (start image only): open with "At 0.00 seconds into the target video,
-  Picture 1 is fully referenced." and begin the scene exactly as that picture
-  establishes it.
-- l2va (end image only): anchor the single picture at the video's final
-  timestamp (the stated duration) and describe how the scene CONVERGES onto
-  its pose/composition.
+def _sections() -> dict[str, str]:
+    """Split the guide doc into {heading: body} by its ## headings."""
+    text = (_DOCS / "minimax_prompt_guide.md").read_text()
+    parts: dict[str, str] = {}
+    heading = "_intro"
+    body: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            parts[heading] = "\n".join(body).strip()
+            heading, body = line[3:].strip(), []
+        else:
+            body.append(line)
+    parts[heading] = "\n".join(body).strip()
+    return parts
 
-## Shots and camera motion
-- First shot has no timestamp; later shots open "At 00:XX.XXX, the camera cuts
-  to...". Prefer hard cuts unless asked otherwise.
-- Camera motion always has three dimensions woven into natural prose:
-  type (push in, pull out, pan, tilt, truck, zoom...), amplitude ("with
-  small/large amplitude") and speed ("at slow/fast speed").
-  e.g. "the camera tilts up with large amplitude at slow speed".
 
-## Dialogue and voiceover
-- Stable speaker IDs (S1), (S2); dialogue in <d>[Language] spoken text</d> blocks.
-- Voiceover must say "off-screen voiceover" and state that lips stay closed.
+def load_guide(workflow: str) -> str:
+    """The MiniMax-H3 prompt-writing guide, sliced to one workflow's format.
 
-## Audio
-The model generates the soundtrack from the prompt: name concrete diegetic sounds
-inline with the action, keep ambience in overall_soundscape and score in
-non_diegetic_music.
+    Returns the format section(s) for the given task type plus the shared
+    craft sections (shots/camera, dialogue, audio) that apply to every prompt.
+    """
+    if workflow not in _FORMAT_SECTIONS:
+        raise ValueError(f"Unknown workflow {workflow!r}; expected one of {sorted(_FORMAT_SECTIONS)}.")
+    parts = _sections()
 
-## ref2va labels
-- <Picture N> = the N-th reference image in upload order.
-- <Subject N> = a reusable element abstracted from the references ("appearance
-  from <Picture 1>"); the normal way to ground a character's identity.
-- summary task types (combine with " + "): keyframe completion, reference
-  generation, video editing, video continuation, audio reuse, audio reference.
-- retention_analysis markers (visual): fully_preserved, partially_preserved,
-  attribute_transfer, weak_reference. Format:
-  "<Subject 1> (appears in [Shot 1]): fully_preserved - <what is kept>."
-- Reference labels appear at first mention in detailed_description and wherever
-  their role applies. A speaking referenced subject: "<Subject 2> (S1) says,
-  <d>[English] ...</d>".
-"""
+    def find(prefix: str) -> str:
+        for heading, body in parts.items():
+            if heading.startswith(prefix):
+                return f"## {heading}\n{body}"
+        raise ValueError(f"Guide section starting with {prefix!r} not found in minimax_prompt_guide.md.")
+
+    wanted = _FORMAT_SECTIONS[workflow] + _SHARED_SECTIONS
+    header = f"# MiniMax-H3 prompt-writing guide — sections for the `{workflow}` task\n"
+    return header + "\n\n".join(find(p) for p in wanted)
+
+
+def load_bufo_description() -> str:
+    """The researched visual description of Bufo (docs/bufo_description.md)."""
+    return (_DOCS / "bufo_description.md").read_text().strip()

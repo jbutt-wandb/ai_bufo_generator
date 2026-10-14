@@ -92,7 +92,7 @@ async def _(BufoRun, build_run_input, config, director, go, images, mo, preset, 
     import re
     from pathlib import Path
 
-    from agents import Runner
+    from agents import RunConfig, Runner
 
     # Only run on an explicit click, never on incidental UI changes.
     mo.stop(not go.value, mo.md("*Fill in a prompt and hit Generate.*"))
@@ -136,23 +136,32 @@ async def _(BufoRun, build_run_input, config, director, go, images, mo, preset, 
     )
 
     # The run is a single await; poll the shared run state to narrate progress.
+    # (Route-first order: workflow is set before the screenplay exists.)
     with mo.status.spinner(
         title="Waiting...",
-        subtitle="Step 1/3 — rewriting your idea into a MiniMax-H3 prompt (Kimi)...",
+        subtitle="Step 1/3 — routing the task type with Laya...",
     ) as _spinner:
         _task = asyncio.create_task(
-            Runner.run(director, build_run_input(run_state), context=run_state, max_turns=10)
+            Runner.run(
+                director,
+                build_run_input(run_state),
+                context=run_state,
+                max_turns=10,
+                run_config=RunConfig(group_id=run_state.group_id),
+            )
         )
         while not _task.done():
-            if run_state.workflow:
+            if run_state.rewritten_prompt:
                 _spinner.update(
                     subtitle=(
-                        f"Step 3/3 — rendering with MiniMax-H3 ({run_state.workflow}): several "
-                        "minutes, plus ~124GB of weights loading on the first run per workflow..."
+                        f"Step 3/3 — the Cameraman renders with MiniMax-H3 ({run_state.workflow}): "
+                        "several minutes, plus ~124GB of weights loading on the first run per workflow..."
                     )
                 )
-            elif run_state.rewritten_prompt:
-                _spinner.update(subtitle="Step 2/3 — routing the workflow with Laya...")
+            elif run_state.workflow:
+                _spinner.update(
+                    subtitle=f"Step 2/3 — the Screenwriter writes the {run_state.workflow} screenplay (Kimi)..."
+                )
             await asyncio.sleep(1)
         result = _task.result()
 
